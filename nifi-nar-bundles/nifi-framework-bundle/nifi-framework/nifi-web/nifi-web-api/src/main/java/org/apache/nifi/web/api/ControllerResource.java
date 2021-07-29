@@ -30,6 +30,11 @@ import org.apache.nifi.authorization.RequestAction;
 import org.apache.nifi.authorization.resource.Authorizable;
 import org.apache.nifi.authorization.user.NiFiUserUtils;
 import org.apache.nifi.controller.FlowController;
+import org.apache.nifi.registry.client.ExtensionRepoClient;
+import org.apache.nifi.registry.client.NiFiRegistryClient;
+import org.apache.nifi.registry.client.NiFiRegistryClientConfig;
+import org.apache.nifi.registry.client.NiFiRegistryException;
+import org.apache.nifi.registry.client.impl.JerseyNiFiRegistryClient;
 import org.apache.nifi.web.IllegalClusterResourceRequestException;
 import org.apache.nifi.web.NiFiServiceFacade;
 import org.apache.nifi.web.Revision;
@@ -53,6 +58,8 @@ import org.apache.nifi.web.api.entity.ReportingTaskEntity;
 import org.apache.nifi.web.api.request.ClientIdParameter;
 import org.apache.nifi.web.api.request.DateTimeParameter;
 import org.apache.nifi.web.api.request.LongParameter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.ws.rs.Consumes;
@@ -66,9 +73,13 @@ import javax.ws.rs.Path;
 import javax.ws.rs.PathParam;
 import javax.ws.rs.Produces;
 import javax.ws.rs.QueryParam;
+import javax.ws.rs.WebApplicationException;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
+
+import java.io.File;
+import java.io.IOException;
 import java.net.URI;
 import java.util.Date;
 import java.util.Set;
@@ -88,6 +99,8 @@ public class ControllerResource extends ApplicationResource {
 
     private ReportingTaskResource reportingTaskResource;
     private ControllerServiceResource controllerServiceResource;
+
+    private static final Logger logger = LoggerFactory.getLogger(ControllerResource.class);
 
     /**
      * Populate the uri's for the specified registry.
@@ -1115,7 +1128,7 @@ public class ControllerResource extends ApplicationResource {
                     @ApiResponse(code = 403, message = "Client is not authorized to make this request."),
                     @ApiResponse(code = 409, message = "The request was valid but NiFi was not in the appropriate state to process it. Retrying the same request later may be successful.")
             }
-    )
+    )    
     public Response deleteHistory(
             @Context final HttpServletRequest httpServletRequest,
             @ApiParam(
@@ -1159,6 +1172,96 @@ public class ControllerResource extends ApplicationResource {
             return endDate;
         }
     }
+
+    /**
+     * Downloads a NAR bundle from a registry server and installs it into the auto-load directory
+     * 
+     * @param registryId The internal registry ID that holds the target NAR
+     * @param bucketName The bucket containing the NAR
+     * @param groupId The groupID of the NAR
+     * @param artifactId The artifactID of the NAR
+     * @param version The NAR version
+     * @return
+     */
+    @POST
+    @Path("extension/{registryId}/{bucketName}/{groupId}/{artifactId}/{version}")
+    @Consumes(MediaType.WILDCARD)
+    @Produces(MediaType.APPLICATION_OCTET_STREAM)
+    @ApiOperation(
+        value = "Downloads a bundle from a registry server",
+        notes = "Downloads the specified bundle from a remote registry server. This is installed onto all nodes in the cluster.",
+        response = byte[].class,
+        authorizations = {
+            @Authorization(value = "Write - /controller")
+        }
+    )
+    @ApiResponses(
+        value = {
+            @ApiResponse(code = 400, message = "Test")
+        }
+    )
+    public Response getExtensionBundleContent(
+        @PathParam("registryId") String registryId,
+        @PathParam("bucketName") String bucketName,
+        @PathParam("groupId") String groupId,
+        @PathParam("artifactId") String artifactId,
+        @PathParam("version") String version
+        ) {
+
+        if (registryId == null) {
+            throw new IllegalArgumentException("The registryId must be specified.");
+        }
+
+        if (bucketName == null) {
+            throw new IllegalArgumentException("The bucketName must be specified.");
+        }
+
+        if (groupId == null) {
+            throw new IllegalArgumentException("The groupId must be specified.");
+        }
+
+        if (artifactId == null) {
+            throw new IllegalArgumentException("The artifactId must be specified.");
+        }
+
+        if (version == null) {
+            throw new IllegalArgumentException("The version must be specified.");
+        }
+
+        authorizeController(RequestAction.WRITE);
+
+        if (isReplicateRequest()) {
+            return replicate(HttpMethod.POST);
+        }
+
+        final RegistryClientEntity entity = serviceFacade.getRegistryClient(registryId);
+
+        final NiFiRegistryClientConfig config = new NiFiRegistryClientConfig.Builder()
+            .connectTimeout(30000)
+            .readTimeout(30000)
+            .baseUrl(entity.getComponent().getUri())
+            .build();
+
+        final NiFiRegistryClient niFiRegistryClient = new JerseyNiFiRegistryClient.Builder()
+            .config(config)
+            .build();
+
+        final ExtensionRepoClient extensionRepoClient = niFiRegistryClient.getExtensionRepoClient();
+        final File outputFolder = getProperties().getNarAutoLoadDirectory();
+
+        try {
+            File output = extensionRepoClient.writeBundleVersionContent(bucketName, groupId, artifactId, version, outputFolder);
+            logger.info("Downloaded {} to {}", output.getName(), output.getPath());
+        } catch (NiFiRegistryException e) {
+            throw new WebApplicationException(new Throwable("Unable to communicate with registry."));
+        } catch (IOException ioe) {
+            throw new WebApplicationException(new Throwable("Unable to write extension bundle to disk."));
+        }
+
+        return Response.ok().build();
+
+    }
+
 
     // setters
 
